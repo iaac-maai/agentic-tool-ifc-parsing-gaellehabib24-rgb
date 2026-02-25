@@ -20,7 +20,13 @@ def main():
     # Configure the API key
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable not set")
+        print(
+            "Error: GEMINI_API_KEY environment variable not set.\n"
+            "You must supply a valid key to authenticate with Gemini.\n"
+            "Create a `.env` file (you can copy `.env.example`) or set the variable in your shell:\n"
+            "  PowerShell: $env:GEMINI_API_KEY='your_key'\n"
+            "  bash/zsh: export GEMINI_API_KEY='your_key'\n"
+        )
         return
 
     genai.configure(api_key=api_key)
