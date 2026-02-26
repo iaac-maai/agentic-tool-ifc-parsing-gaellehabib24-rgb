@@ -9,6 +9,12 @@ import os
 from dotenv import load_dotenv
 
 from ifc_parse import parse_ifc_file, ifc_parse_tool
+import ifcopenshell
+from tools.checker_building_code import (
+    check_space_compliance,
+    analyze_window_compliance,
+    analyze_evacuation_routes,
+)
 
 
 def main():
@@ -31,71 +37,170 @@ def main():
 
     genai.configure(api_key=api_key)
 
-    # Create the model with the IFC parser tool
-    model = genai.GenerativeModel(
-        model_name='gemini-2.5-flash',
-        tools=[ifc_parse_tool]
+    # Define Gemini tools for the parser and compliance checkers
+    checker_space_tool = genai.protos.Tool(
+        function_declarations=[
+            genai.protos.FunctionDeclaration(
+                name="check_space_compliance",
+                description="Run space compliance checks on an IFC file",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "file_path": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Path to the IFC file to check"
+                        )
+                    },
+                    required=["file_path"]
+                )
+            )
+        ]
     )
 
-    # Start a chat session
-    chat = model.start_chat()
+    checker_window_tool = genai.protos.Tool(
+        function_declarations=[
+            genai.protos.FunctionDeclaration(
+                name="analyze_window_compliance",
+                description="Analyze window compliance for an IFC file",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "file_path": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Path to the IFC file to check"
+                        )
+                    },
+                    required=["file_path"]
+                )
+            )
+        ]
+    )
 
-    # Example prompt that should trigger the IFC parser tool
-    prompt = "Parse the IFC file at 'sample.ifc' and tell me how many walls, doors, and windows are in the building."
-    print(f"User: {prompt}\n")
+    checker_evac_tool = genai.protos.Tool(
+        function_declarations=[
+            genai.protos.FunctionDeclaration(
+                name="analyze_evacuation_routes",
+                description="Analyze evacuation routes for an IFC file",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "file_path": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Path to the IFC file to check"
+                        )
+                    },
+                    required=["file_path"]
+                )
+            )
+        ]
+    )
 
-    response = chat.send_message(prompt)
+    # Create the model with all registered tools
+    model = genai.GenerativeModel(
+        model_name='gemini-2.5-flash',
+        tools=[t for t in (ifc_parse_tool, checker_space_tool, checker_window_tool, checker_evac_tool) if t]
+    )
 
-    # Handle function calls
-    max_iterations = 10
-    iteration = 0
-    
-    while iteration < max_iterations and response.candidates[0].content.parts:
-        iteration += 1
-        
-        # Check if there's a function call
-        if not hasattr(response.candidates[0].content.parts[0], 'function_call'):
+    print("\n🏗️  IFC Parser Agent Ready!")
+    print("Examples: 'Parse sample.ifc', 'What spaces are there?', 'Check building code compliance'")
+    print("Type 'exit' to quit.\n")
+
+    # Interactive chat loop
+    while True:
+        try:
+            user_prompt = input("You: ").strip()
+        except EOFError:
+            print("Goodbye!")
             break
+
+        if user_prompt.lower() == 'exit':
+            print("Goodbye!")
+            break
+
+        if not user_prompt:
+            continue
+
+        # Start a new chat session for each conversation
+        chat = model.start_chat()
+
+        # Send user message
+        response = chat.send_message(user_prompt)
+
+        # Handle function calls
+        max_iterations = 10
+        iteration = 0
+        
+        while iteration < max_iterations and response.candidates[0].content.parts:
+            iteration += 1
             
-        function_call = response.candidates[0].content.parts[0].function_call
-        
-        # Check if function_call is None or has no name
-        if function_call is None or not function_call.name:
-            break
+            # Check if there's a function call
+            if not hasattr(response.candidates[0].content.parts[0], 'function_call'):
+                break
+                
+            function_call = response.candidates[0].content.parts[0].function_call
+            
+            # Check if function_call is None or has no name
+            if function_call is None or not function_call.name:
+                break
 
-        print(f"Tool called: {function_call.name}")
-        
-        # Handle args safely (may be None)
-        args = dict(function_call.args) if function_call.args else {}
-        print(f"Arguments: {args}\n")
+            print(f"[Tool called: {function_call.name}]")
+            
+            # Handle args safely (may be None)
+            args = dict(function_call.args) if function_call.args else {}
 
-        # Execute the function
-        if function_call.name == "parse_ifc":
-            result = parse_ifc_file(
-                file_path=args.get('file_path', '')
+            # Execute the function
+            if function_call.name == "parse_ifc":
+                result = parse_ifc_file(
+                    file_path=args.get('file_path', 'sample.ifc')
+                )
+            elif function_call.name == "check_space_compliance":
+                fp = args.get('file_path', 'sample.ifc')
+                try:
+                    m = ifcopenshell.open(fp)
+                    result = check_space_compliance(m)
+                except Exception as e:
+                    result = {"error": f"Failed to run space compliance: {e}"}
+            elif function_call.name == "analyze_window_compliance":
+                fp = args.get('file_path', 'sample.ifc')
+                try:
+                    m = ifcopenshell.open(fp)
+                    result = analyze_window_compliance(m)
+                except Exception as e:
+                    result = {"error": f"Failed to run window compliance: {e}"}
+            elif function_call.name == "analyze_evacuation_routes":
+                fp = args.get('file_path', 'sample.ifc')
+                try:
+                    m = ifcopenshell.open(fp)
+                    result = analyze_evacuation_routes(m)
+                except Exception as e:
+                    result = {"error": f"Failed to run evacuation analysis: {e}"}
+            else:
+                result = {"error": "Unknown function"}
+
+            # Prepare payload: Gemini's proto marshal expects a mapping
+            if isinstance(result, dict):
+                response_payload = result
+            else:
+                # wrap lists or other values in a mapping so proto can marshal
+                response_payload = {"results": result}
+
+            # Send the result back to Gemini
+            response = chat.send_message(
+                genai.protos.Content(
+                    parts=[genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=function_call.name,
+                            response=response_payload
+                        )
+                    )]
+                )
             )
+
+        # Print the assistant response
+        if response.candidates[0].content.parts:
+            print(f"Assistant: {response.text}\n")
         else:
-            result = {"error": "Unknown function"}
-
-        print(f"Tool result: {result}\n")
-
-        # Send the result back to Gemini
-        response = chat.send_message(
-            genai.protos.Content(
-                parts=[genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=function_call.name,
-                        response=result
-                    )
-                )]
-            )
-        )
-
-    # Print the final response
-    if response.candidates[0].content.parts:
-        print(f"Assistant: {response.text}")
-    else:
-        print("No response generated.")
+            print("No response generated.\n")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,136 @@ import google.generativeai as genai
 import os
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Helper routines for extracting semantic data from IFC models using
+# ifcopenshell. These are used by the parser to build structured lists of
+# spaces and windows so that downstream analysis (e.g. code compliance
+# checks) can operate on them.
+# ---------------------------------------------------------------------------
+
+def _get_space_area(space) -> float | None:
+    """Try to determine floor area of an IfcSpace from available data."""
+    # direct attribute
+    for attr in ("NetFloorArea", "GrossFloorArea", "Area"):  # common names
+        if hasattr(space, attr):
+            try:
+                return float(getattr(space, attr))
+            except Exception:
+                pass
+
+    # inspect related property sets and quantities
+    for rel in getattr(space, "IsDefinedBy", []) or []:
+        if rel.is_a("IfcRelDefinesByProperties"):
+            pdef = rel.RelatingPropertyDefinition
+            # quantities like IfcElementQuantity hold area measures
+            if pdef and pdef.is_a("IfcElementQuantity"):
+                for q in getattr(pdef, "Quantities", []):
+                    # many quantity types exist; look for area values
+                    if q.is_a("IfcQuantityArea"):
+                        try:
+                            return float(q.AreaValue)
+                        except Exception:
+                            pass
+            elif pdef and pdef.is_a("IfcPropertySet"):
+                for prop in getattr(pdef, "HasProperties", []):
+                    name = getattr(prop, "Name", "").lower()
+                    if "area" in name:
+                        val = getattr(prop, "NominalValue", None)
+                        if val is not None and hasattr(val, "wrappedValue"):
+                            try:
+                                return float(val.wrappedValue)
+                            except Exception:
+                                pass
+    return None
+
+
+def _get_space_height(space) -> float | None:
+    """Extract a height value if available on the space or its properties."""
+    for attr in ("Height", "UnboundedHeight", "Elevation"):
+        if hasattr(space, attr):
+            try:
+                return float(getattr(space, attr))
+            except Exception:
+                pass
+
+    # look for a property set containing height information
+    for rel in getattr(space, "IsDefinedBy", []) or []:
+        if rel.is_a("IfcRelDefinesByProperties"):
+            pdef = rel.RelatingPropertyDefinition
+            if pdef and pdef.is_a("IfcPropertySet"):
+                for prop in getattr(pdef, "HasProperties", []):
+                    name = getattr(prop, "Name", "").lower()
+                    if "height" in name:
+                        val = getattr(prop, "NominalValue", None)
+                        if val is not None and hasattr(val, "wrappedValue"):
+                            try:
+                                return float(val.wrappedValue)
+                            except Exception:
+                                pass
+    return None
+
+
+def _extract_spaces(model) -> list[dict]:
+    """Return a simplified dictionary for each IfcSpace in the model."""
+    spaces = []
+    for sp in model.by_type("IfcSpace"):
+        spaces.append({
+            "id": getattr(sp, "GlobalId", None),
+            "name": getattr(sp, "Name", None),
+            "long_name": getattr(sp, "LongName", None),
+            "classification": getattr(sp, "PredefinedType", None) or getattr(sp, "Classification", None),
+            "area": _get_space_area(sp),
+            "height": _get_space_height(sp),
+        })
+    return spaces
+
+
+def _get_window_area(window) -> float | None:
+    """Compute rough area of a window from its overall dimensions."""
+    w = getattr(window, "OverallWidth", None)
+    h = getattr(window, "OverallHeight", None)
+    try:
+        if w is not None and h is not None:
+            return float(w) * float(h)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_windows(model) -> list[dict]:
+    """Simplified representation for each IfcWindow in the model."""
+    wins = []
+    for w in model.by_type("IfcWindow"):
+        wins.append({
+            "id": getattr(w, "GlobalId", None),
+            "name": getattr(w, "Name", None),
+            "width": getattr(w, "OverallWidth", None),
+            "height": getattr(w, "OverallHeight", None),
+            "area": _get_window_area(w),
+        })
+    return wins
+
+
+def _extract_evacuation_routes(model) -> list[dict]:
+    """Gather spaces that appear to be part of a fire safety/evacuation route.
+
+    For the purposes of the simple example we flag any space whose name
+    contains keywords like 'stair', 'exit', 'corridor' or 'hall'.  A real
+    implementation would follow explicit IfcRelFlowSegment or IsDefinedBy
+    relationships.
+    """
+    keywords = ("stair", "exit", "corridor", "hallway", "hall")
+    routes = []
+    for sp in model.by_type("IfcSpace"):
+        name = (getattr(sp, "Name", "") or "").lower()
+        if any(k in name for k in keywords):
+            routes.append({
+                "id": getattr(sp, "GlobalId", None),
+                "name": getattr(sp, "Name", None),
+            })
+    return routes
+
+
 
 def parse_ifc_file(file_path: str) -> dict:
     """
@@ -71,6 +201,25 @@ def parse_ifc_file(file_path: str) -> dict:
         ifccolumn_count = entities.count('IFCCOLUMN')
         ifcbeam_count = entities.count('IFCBEAM')
         
+        # also attempt to open the file with ifcopenshell so we can extract
+        # more semantic information about spaces, windows, and evacuation
+        # routes.  Predefine variables so that failures do not leave them
+        # undefined.
+        spaces = []
+        windows = []
+        evacuation_routes = []
+        try:
+            import ifcopenshell
+            model = ifcopenshell.open(str(file_path))
+            spaces = _extract_spaces(model)
+            windows = _extract_windows(model)
+            evacuation_routes = _extract_evacuation_routes(model)
+        except Exception:
+            # if ifcopenshell is not available or parsing fails we simply ignore
+            spaces = []
+            windows = []
+            evacuation_routes = []
+
         return {
             "file": str(file_path),
             "status": "success",
@@ -86,7 +235,10 @@ def parse_ifc_file(file_path: str) -> dict:
                 "columns": ifccolumn_count,
                 "beams": ifcbeam_count,
             },
-            "entity_types": entity_counts
+            "entity_types": entity_counts,
+            "spaces": spaces,
+            "windows": windows,
+            "evacuation_routes": evacuation_routes,
         }
     
     except Exception as e:
